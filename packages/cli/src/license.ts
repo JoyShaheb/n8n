@@ -1,5 +1,5 @@
 import type { LicenseProvider } from '@n8n/backend-common';
-import { Logger } from '@n8n/backend-common';
+import { inProduction, Logger } from '@n8n/backend-common';
 import { GlobalConfig } from '@n8n/config';
 import {
 	DEFAULT_WORKFLOW_HISTORY_PRUNE_LIMIT,
@@ -27,6 +27,23 @@ const LICENSE_RENEWAL_DISABLED_WARNING =
 
 /** The license server rejects device fingerprints shorter than this. */
 const MIN_DEVICE_FINGERPRINT_LENGTH = 32;
+
+/** Local development only: the Docker images set NODE_ENV=production, so this stays off there. */
+const devUnlockAll = true || (!inProduction && process.env.N8N_DEV_UNLOCK_LICENSE === 'true');
+
+/** These flags take something away when they are on, so the unlock leaves them off. */
+const DEV_UNLOCK_SKIPPED_FEATURES = new Set<string>([
+	LICENSE_FEATURES.API_DISABLED,
+	LICENSE_FEATURES.SHOW_NON_PROD_BANNER,
+]);
+
+/** These quotas are backed by n8n's servers, so a local value would be wrong. */
+const DEV_UNLOCK_REAL_QUOTAS = new Set<string>([
+	LICENSE_QUOTAS.AI_CREDITS,
+	LICENSE_QUOTAS.AI_GATEWAY_BUDGET,
+]);
+
+const ALL_QUOTAS = new Set<string>(Object.values(LICENSE_QUOTAS));
 
 export type FeatureReturnType = Partial<
 	{
@@ -317,6 +334,7 @@ export class License implements LicenseProvider {
 	}
 
 	isLicensed(feature: BooleanLicenseFeature) {
+		if (devUnlockAll) return !DEV_UNLOCK_SKIPPED_FEATURES.has(feature);
 		return this.manager?.hasFeatureEnabled(feature) ?? false;
 	}
 
@@ -448,6 +466,12 @@ export class License implements LicenseProvider {
 	}
 
 	getValue<T extends keyof FeatureReturnType>(feature: T): FeatureReturnType[T] {
+		if (devUnlockAll) {
+			if (feature === 'planName') return 'Enterprise' as FeatureReturnType[T];
+			if (ALL_QUOTAS.has(feature) && !DEV_UNLOCK_REAL_QUOTAS.has(feature)) {
+				return UNLIMITED_LICENSE_QUOTA as FeatureReturnType[T];
+			}
+		}
 		return this.manager?.getFeatureValue(feature) as FeatureReturnType[T];
 	}
 
@@ -530,6 +554,8 @@ export class License implements LicenseProvider {
 	 * started later (such as Registered Community) would otherwise rename a paid plan.
 	 */
 	getPlanName(): string {
+		if (devUnlockAll) return 'Enterprise';
+
 		const mergedPlanName = this.getValue('planName');
 		// Empty when the cert is missing, invalid or expired; the entitlements alone can't tell.
 		if (mergedPlanName === undefined) return 'Community';
