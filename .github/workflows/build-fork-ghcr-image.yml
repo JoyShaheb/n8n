@@ -1,0 +1,142 @@
+# Builds the n8n and runners images on standard GitHub-hosted runners and pushes
+# them to the GitHub Container Registry (ghcr.io) of this fork.
+#
+# docker-build-push.yml needs Blacksmith runners, which only n8n-io can use.
+# This file is separate from it, so syncing the fork with upstream does not
+# cause merge conflicts.
+
+name: 'Fork: Build and Push Images to GHCR'
+run-name: 'Fork: Build images from ${{ github.ref_name }} (${{ inputs.platform }})'
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag. Leave empty to use the branch name.'
+        required: false
+        type: string
+        default: ''
+      platform:
+        description: 'CPU architecture of the server that runs the image'
+        required: false
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+        default: linux/amd64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
+env:
+  NODE_OPTIONS: '--max-old-space-size=7168'
+
+jobs:
+  build-and-push:
+    name: Build and push (${{ inputs.platform }})
+    # n8n-io publishes its own images with docker-build-push.yml.
+    if: github.repository != 'n8n-io/n8n'
+    # Standard runners are free on public repositories. Native builds are much
+    # faster than emulated ones, so arm64 uses an arm64 runner.
+    runs-on: ${{ inputs.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # The full build and the image layers do not fit in the free disk space of
+      # a standard runner. Remove preinstalled SDKs that the build does not use.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Determine image names
+        id: image
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          # ghcr.io rejects uppercase letters in repository names.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+
+          tag="${TAG_INPUT:-$GITHUB_REF_NAME}"
+          tag="$(printf '%s' "$tag" | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^[.-]+//' | cut -c1-120)"
+          if [ -z "$tag" ]; then
+            echo "::error::The image tag is empty after the invalid characters were removed"
+            exit 1
+          fi
+
+          # Builds for each architecture get their own tag, so that one build does
+          # not overwrite the other.
+          if [ "$PLATFORM" = 'linux/arm64' ]; then
+            tag="${tag}-arm64"
+          fi
+
+          {
+            echo "n8n=ghcr.io/${owner}/n8n"
+            echo "runners=ghcr.io/${owner}/runners"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      # docker-bake.hcl holds the Node version of the images. The host uses the
+      # same one, because the images copy native bindings from this build.
+      - name: Read the Node version
+        id: node
+        run: |
+          version=$(sed -nE 's/^variable "NODE_VERSION" \{ default = "([^"]+)" \}$/\1/p' docker/docker-bake.hcl)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup and build
+        uses: ./.github/actions/setup-nodejs
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+          build-command: pnpm build:n8n
+
+      # dockerize-n8n.mjs pushes with --push, which needs a container-driver builder.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: ./.github/actions/docker-registry-login
+        with:
+          login-ghcr: true
+
+      # The image names include a registry host, so the script pushes both
+      # images directly instead of loading them into the local daemon.
+      - name: Build and push the images
+        env:
+          IMAGE_BASE_NAME: ${{ steps.image.outputs.n8n }}
+          RUNNERS_IMAGE_BASE_NAME: ${{ steps.image.outputs.runners }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          DOCKER_PLATFORM: ${{ inputs.platform }}
+        run: node scripts/dockerize-n8n.mjs
+
+      - name: Write the summary
+        env:
+          N8N_IMAGE: ${{ steps.image.outputs.n8n }}:${{ steps.image.outputs.tag }}
+          RUNNERS_IMAGE: ${{ steps.image.outputs.runners }}:${{ steps.image.outputs.tag }}
+        run: |
+          {
+            echo '### Pushed images'
+            echo
+            echo "- \`${N8N_IMAGE}\`"
+            echo "- \`${RUNNERS_IMAGE}\`"
+            echo
+            echo 'Run n8n:'
+            echo
+            echo '```bash'
+            echo "docker run -it --rm -p 5678:5678 -v n8n_data:/home/node/.n8n ${N8N_IMAGE}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
